@@ -11,6 +11,8 @@ __url__ = 'https://github.com/eddie3/gogrepo'
 
 # imports
 import os
+import subprocess
+import ssl
 import sys
 import threading
 import logging
@@ -37,8 +39,8 @@ try:
     import cookielib as cookiejar
     from httplib import BadStatusLine
     from urlparse import urlparse
-    from urllib import urlencode
-    from urllib2 import HTTPError, URLError, HTTPCookieProcessor, build_opener, Request
+    from urllib import urlencode, unquote
+    from urllib2 import HTTPError, URLError, HTTPCookieProcessor, HTTPSHandler, build_opener, Request
     from itertools import izip_longest as zip_longest
     from StringIO import StringIO
 except ImportError:
@@ -46,8 +48,8 @@ except ImportError:
     from queue import Queue
     import http.cookiejar as cookiejar
     from http.client import BadStatusLine
-    from urllib.parse import urlparse, urlencode
-    from urllib.request import HTTPCookieProcessor, HTTPError, URLError, build_opener, Request
+    from urllib.parse import urlparse, urlencode, unquote
+    from urllib.request import HTTPCookieProcessor, HTTPError, URLError, HTTPSHandler, build_opener, Request
     from itertools import zip_longest
     from io import StringIO
 
@@ -89,7 +91,14 @@ INFO_FILENAME = r'!info.txt'
 # global web utilities
 global_cookies = cookiejar.LWPCookieJar(COOKIES_FILENAME)
 cookieproc = HTTPCookieProcessor(global_cookies)
-opener = build_opener(cookieproc)
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+# ctx.verify_mode = ssl.CERT_NONE
+
+opener = build_opener(HTTPSHandler(context=ctx), cookieproc)
+# opener.addheaders = [('Referer', 'http://example.org/blah.html')]
+
 treebuilder = html5lib.treebuilders.getTreeBuilder('etree')
 parser = html5lib.HTMLParser(tree=treebuilder, namespaceHTMLElements=False)
 
@@ -115,6 +124,8 @@ DEFAULT_LANG_LIST = ['en']
 
 # These file types don't have md5 data from GOG
 SKIP_MD5_FILE_EXT = ['.txt', '.zip']
+SKIP_DIRS = ['@eaDir']
+SKIP_FILES = ['.DS_Store']
 
 # Language table that maps two letter language to their unicode gogapi json name
 LANG_TABLE = {'en': u'English',   # English
@@ -352,11 +363,14 @@ def fetch_file_info(d, fetch_md5):
     # fetch file name/size
     with request(d.href, byte_range=(0, 0)) as page:
         d.name = urlparse(page.geturl()).path.split('/')[-1]
+        d.name = unquote(d.name).decode('utf8')
+        if 'Descent' in d.name:
+            info(d.name)
         d.size = int(page.headers['Content-Range'].split('/')[-1])
 
         # fetch file md5
         if fetch_md5:
-            if os.path.splitext(page.geturl())[1].lower() not in SKIP_MD5_FILE_EXT:
+            if os.path.splitext(d.name)[1].lower() not in SKIP_MD5_FILE_EXT:
                 tmp_md5_url = page.geturl().replace('?', '.xml?')
                 try:
                     with request(tmp_md5_url) as page:
@@ -489,6 +503,8 @@ def process_argv(argv):
     g1 = sp1.add_parser('clean', help='Clean your games directory of files not known by manifest')
     g1.add_argument('cleandir', action='store', help='root directory containing gog games to be cleaned')
     g1.add_argument('-dryrun', action='store_true', help='do not move files, only display what would be cleaned')
+
+    g1 = sp1.add_parser('resave', help='Load and resave the manifest, urldecoding download names')
 
     g1 = p1.add_argument_group('other')
     g1.add_argument('-h', '--help', action='help', help='show help message and exit')
@@ -735,22 +751,34 @@ def cmd_import(src_dir, dest_dir):
 
     info("collecting md5 data out of the manifest")
     md5_info = {}  # holds tuples of (title, filename) with md5 as key
+    md5_fnames = set()
 
     for game in gamesdb:
         for game_item in game.downloads:
             if game_item.md5 is not None:
                 md5_info[game_item.md5] = (game.title, game_item.name)
+                md5_fnames.add(game_item.name)
 
     info("searching for files within '%s'" % src_dir)
     file_list = []
     for (root, dirnames, filenames) in os.walk(src_dir):
+        for d in SKIP_DIRS:
+            if d in dirnames:
+                dirnames.remove(d)
+
         for f in filenames:
+            if f in SKIP_FILES:
+                continue
             if os.path.splitext(f)[1].lower() not in SKIP_MD5_FILE_EXT:
                 file_list.append(os.path.join(root, f))
 
+
     info("comparing md5 file hashes")
-    for f in file_list:
+    for f in sorted(file_list):
         fname = os.path.basename(f)
+        if fname not in md5_fnames:
+            continue
+
         info("calculating md5 for '%s'" % fname)
         h = hashfile(f)
         if h in md5_info:
@@ -758,14 +786,16 @@ def cmd_import(src_dir, dest_dir):
             src_dir = os.path.join(dest_dir, title)
             dest_file = os.path.join(src_dir, fname)
             info('found a match! [%s] -> %s' % (h, fname))
-            if os.path.isfile(dest_file):
-                if h == hashfile(dest_file):
-                    info('destination file already exists with the same md5 value.  skipping copy.')
-                    continue
-            info("copying to %s..." % dest_file)
+#            if os.path.isfile(dest_file):
+#                if h == hashfile(dest_file):
+#                    info('destination file already exists with the same md5 value.  skipping copy.')
+#                    continue
             if not os.path.isdir(src_dir):
                 os.makedirs(src_dir)
-            shutil.copy(f, dest_file)
+            info("hard linking to %s..." % dest_file)
+            subprocess.check_output(['ln', '-f', f, dest_file])
+            # info("copying to %s..." % dest_file)
+            # shutil.copy(f, dest_file)
 
 
 def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
@@ -1131,6 +1161,14 @@ def cmd_clean(cleandir, dryrun):
     else:
         info('nothing to clean. nice and tidy!')
 
+def cmd_resave():
+    gamesdb = load_manifest()
+    for game in gamesdb:
+        for game_item in game.downloads:
+            game_item.name = unquote(game_item.name).decode('utf8')
+        for game_item in game.extras:
+            game_item.name = unquote(game_item.name).decode('utf8')
+    save_manifest(gamesdb)
 
 def main(args):
     stime = datetime.datetime.now()
@@ -1156,6 +1194,8 @@ def main(args):
         cmd_backup(args.src_dir, args.dest_dir)
     elif args.cmd == 'clean':
         cmd_clean(args.cleandir, args.dryrun)
+    elif args.cmd == 'resave':
+        cmd_resave()
 
     etime = datetime.datetime.now()
     info('--')
